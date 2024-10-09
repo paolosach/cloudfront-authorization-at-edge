@@ -56,7 +56,7 @@ function getDefaultCookieSettings(props: {
     };
   }
   throw new Error(
-    `Cannot determine default cookiesettings for ${props.mode} with compatibility ${props.compatibility}`
+    `Cannot determine default cookie settings for ${props.mode} with compatibility ${props.compatibility}`
   );
 }
 
@@ -301,6 +301,7 @@ export function getAmplifyCookieNames(
     idTokenKey: `${keyPrefix}.${tokenUserName}.idToken`,
     accessTokenKey: `${keyPrefix}.${tokenUserName}.accessToken`,
     refreshTokenKey: `${keyPrefix}.${tokenUserName}.refreshToken`,
+    hostedUiKey: "amplify-signin-with-hostedUI",
   };
 }
 
@@ -339,6 +340,7 @@ export function extractAndParseCookies(
     nonce: cookies["spa-auth-edge-nonce"],
     nonceHmac: cookies["spa-auth-edge-nonce-hmac"],
     pkce: cookies["spa-auth-edge-pkce"],
+    refreshFailed: cookies["spa-auth-edge-refresh"],
   };
 }
 
@@ -360,130 +362,189 @@ export const generateCookieHeaders = {
     param: GenerateCookieHeadersParam & {
       tokens: { id: string; access: string; refresh: string };
     }
-  ) => _generateCookieHeaders({ ...param, event: "signIn" }),
+  ) => _generateCookieHeaders({ ...param, scenario: "SIGN_IN" }),
   refresh: (
     param: GenerateCookieHeadersParam & {
       tokens: { id: string; access: string };
     }
-  ) => _generateCookieHeaders({ ...param, event: "refresh" }),
+  ) => _generateCookieHeaders({ ...param, scenario: "REFRESH" }),
+  refreshFailed: (param: GenerateCookieHeadersParam) =>
+    _generateCookieHeaders({ ...param, scenario: "REFRESH_FAILED" }),
   signOut: (param: GenerateCookieHeadersParam) =>
-    _generateCookieHeaders({ ...param, event: "signOut" }),
+    _generateCookieHeaders({ ...param, scenario: "SIGN_OUT" }),
 };
 
 function _generateCookieHeaders(
   param: GenerateCookieHeadersParam & {
-    event: "signIn" | "signOut" | "refresh";
+    scenario: "SIGN_IN" | "SIGN_OUT" | "REFRESH" | "REFRESH_FAILED";
   }
 ) {
   /**
-   * Generate cookie headers for the following scenario's:
-   *  - signIn: called from Parse Auth lambda, when receiving fresh JWTs from Cognito
-   *  - sign out: called from Sign Out Lambda, when the user visits the sign out URL
-   *  - refresh: called from Refresh Auth lambda, when receiving fresh ID and Access JWTs from Cognito
+   * Generate cookie headers to set, or clear, cookies with JWTs.
    *
-   *   Note that there are other places besides this helper function where cookies can be set (search codebase for "set-cookie")
+   * This is centralized in this function because there is logic to determine
+   * the right cookie names, that we do not want to repeat everywhere.
+   *
+   * Note that there are other places besides this helper function where
+   * cookies can be set (search codebase for "set-cookie").
    */
 
   const decodedIdToken = decodeToken(param.tokens.id);
   const tokenUserName = decodedIdToken["cognito:username"];
+  const userData = JSON.stringify({
+    UserAttributes: [
+      {
+        Name: "sub",
+        Value: decodedIdToken["sub"],
+      },
+      {
+        Name: "email",
+        Value: decodedIdToken["email"],
+      },
+    ],
+    Username: tokenUserName,
+  });
 
-  const cookies: Cookies = {};
-  let cookieNames:
-    | ReturnType<typeof getAmplifyCookieNames>
-    | ReturnType<typeof getElasticsearchCookieNames>;
-  if (param.cookieCompatibility === "amplify") {
-    cookieNames = getAmplifyCookieNames(param.clientId, tokenUserName);
-    const userData = JSON.stringify({
-      UserAttributes: [
-        {
-          Name: "sub",
-          Value: decodedIdToken["sub"],
-        },
-        {
-          Name: "email",
-          Value: decodedIdToken["email"],
-        },
-      ],
-      Username: tokenUserName,
-    });
+  const cookiesToSetOrExpire: Cookies = {};
+  const cookieNames =
+    param.cookieCompatibility === "amplify"
+      ? getAmplifyCookieNames(param.clientId, tokenUserName)
+      : getElasticsearchCookieNames();
 
-    // Construct object with the cookies
-    Object.assign(cookies, {
-      [cookieNames.lastUserKey]: `${tokenUserName}; ${param.cookieSettings.idToken}`,
-      [cookieNames.scopeKey]: `${param.oauthScopes.join(" ")}; ${
-        param.cookieSettings.accessToken
-      }`,
-      [cookieNames.userDataKey]: `${encodeURIComponent(userData)}; ${
-        param.cookieSettings.idToken
-      }`,
-      "amplify-signin-with-hostedUI": `true; ${param.cookieSettings.accessToken}`,
-    });
-  } else {
-    cookieNames = getElasticsearchCookieNames();
-    cookies[
-      cookieNames.cognitoEnabledKey
-    ] = `True; ${param.cookieSettings.cognitoEnabled}`;
-  }
-
-  // Set JWTs in the cookies
-  cookies[
-    cookieNames.idTokenKey
-  ] = `${param.tokens.id}; ${param.cookieSettings.idToken}`;
-  if (param.tokens.access) {
-    cookies[
+  // Set or clear JWTs from the cookies
+  if (param.scenario === "SIGN_IN") {
+    // JWTs:
+    cookiesToSetOrExpire[
+      cookieNames.idTokenKey
+    ] = `${param.tokens.id}; ${param.cookieSettings.idToken}`;
+    cookiesToSetOrExpire[
       cookieNames.accessTokenKey
     ] = `${param.tokens.access}; ${param.cookieSettings.accessToken}`;
-  }
-  if (param.tokens.refresh) {
-    cookies[
+    cookiesToSetOrExpire[
       cookieNames.refreshTokenKey
     ] = `${param.tokens.refresh}; ${param.cookieSettings.refreshToken}`;
-  }
-
-  if (param.event === "signOut") {
-    // Expire all cookies
-    Object.keys(cookies).forEach(
-      (key) => (cookies[key] = expireCookie(cookies[key]))
+    // Other cookies:
+    if ("lastUserKey" in cookieNames)
+      cookiesToSetOrExpire[
+        cookieNames.lastUserKey
+      ] = `${tokenUserName}; ${param.cookieSettings.idToken}`;
+    if ("scopeKey" in cookieNames)
+      cookiesToSetOrExpire[cookieNames.scopeKey] = `${param.oauthScopes.join(
+        " "
+      )}; ${param.cookieSettings.accessToken}`;
+    if ("userDataKey" in cookieNames)
+      cookiesToSetOrExpire[cookieNames.userDataKey] = `${encodeURIComponent(
+        userData
+      )}; ${param.cookieSettings.idToken}`;
+    if ("hostedUiKey" in cookieNames)
+      cookiesToSetOrExpire[
+        cookieNames.hostedUiKey
+      ] = `true; ${param.cookieSettings.accessToken}`;
+    if ("cognitoEnabledKey" in cookieNames)
+      cookiesToSetOrExpire[
+        cookieNames.cognitoEnabledKey
+      ] = `True; ${param.cookieSettings.cognitoEnabled}`;
+    // Clear marker for failed refresh
+    cookiesToSetOrExpire["spa-auth-edge-refresh"] = addExpiry(
+      param.cookieSettings.nonce
     );
+  } else if (param.scenario === "REFRESH") {
+    cookiesToSetOrExpire[
+      cookieNames.idTokenKey
+    ] = `${param.tokens.id}; ${param.cookieSettings.idToken}`;
+    cookiesToSetOrExpire[
+      cookieNames.accessTokenKey
+    ] = `${param.tokens.access}; ${param.cookieSettings.accessToken}`;
+    // Clear marker for failed refresh
+    cookiesToSetOrExpire["spa-auth-edge-refresh"] = addExpiry(
+      param.cookieSettings.nonce
+    );
+  } else if (param.scenario === "SIGN_OUT") {
+    // Expire JWTs
+    cookiesToSetOrExpire[cookieNames.idTokenKey] = addExpiry(
+      param.cookieSettings.idToken
+    );
+    cookiesToSetOrExpire[cookieNames.accessTokenKey] = addExpiry(
+      param.cookieSettings.accessToken
+    );
+    cookiesToSetOrExpire[cookieNames.refreshTokenKey] = addExpiry(
+      param.cookieSettings.refreshToken
+    );
+    // Expire other cookies
+    if ("lastUserKey" in cookieNames)
+      cookiesToSetOrExpire[cookieNames.lastUserKey] = addExpiry(
+        param.cookieSettings.idToken
+      );
+    if ("scopeKey" in cookieNames)
+      cookiesToSetOrExpire[cookieNames.scopeKey] = addExpiry(
+        param.cookieSettings.accessToken
+      );
+    if ("userDataKey" in cookieNames)
+      cookiesToSetOrExpire[cookieNames.userDataKey] = addExpiry(
+        param.cookieSettings.idToken
+      );
+    if ("hostedUiKey" in cookieNames)
+      cookiesToSetOrExpire[cookieNames.hostedUiKey] = addExpiry(
+        param.cookieSettings.accessToken
+      );
+    if ("cognitoEnabledKey" in cookieNames)
+      cookiesToSetOrExpire[cookieNames.cognitoEnabledKey] = addExpiry(
+        param.cookieSettings.cognitoEnabled
+      );
+    // Clear marker for failed refresh
+    cookiesToSetOrExpire["spa-auth-edge-refresh"] = addExpiry(
+      param.cookieSettings.nonce
+    );
+  } else if (param.scenario === "REFRESH_FAILED") {
+    // Expire refresh token only
+    cookiesToSetOrExpire[cookieNames.refreshTokenKey] = addExpiry(
+      param.cookieSettings.refreshToken
+    );
+    // Add marker for failed refresh
+    cookiesToSetOrExpire[
+      "spa-auth-edge-refresh"
+    ] = `failed; ${param.cookieSettings.nonce}`;
   }
 
-  // Always expire nonce, nonceHmac and pkce - this is valid in all scenario's:
-  // * event === 'newTokens' --> you just signed in and used your nonce and pkce successfully, don't need them no more
-  // * event === 'refreshFailed' --> you are signed in already, why do you still have a nonce?
-  // * event === 'signOut' --> clear ALL cookies anyway
+  // Always expire nonce, nonceHmac and pkce
   [
     "spa-auth-edge-nonce",
     "spa-auth-edge-nonce-hmac",
     "spa-auth-edge-pkce",
   ].forEach((key) => {
-    cookies[key] = expireCookie(`;${param.cookieSettings.nonce}`);
+    cookiesToSetOrExpire[key] = addExpiry(param.cookieSettings.nonce);
   });
 
   // Return cookie object in format of CloudFront headers
   return Object.entries({
     ...param.additionalCookies,
-    ...cookies,
+    ...cookiesToSetOrExpire,
   }).map(([k, v]) => ({ key: "set-cookie", value: `${k}=${v}` }));
 }
 
-function expireCookie(cookie: string = "") {
-  const cookieParts = cookie
+/**
+ * Expire a cookie by setting its expiration time to the epoch start
+ * @param cookieSettings The cookie settings to add the expire setting to, for example: "Domain=example.com; Secure; HttpOnly"
+ * @returns Updated cookie settings that you can use as cookie value, i.e. with leading ; and expire instruction, for example: "; Domain=example.com; Secure; HttpOnly; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
+ */
+function addExpiry(cookieSettings: string) {
+  const parts = cookieSettings
     .split(";")
     .map((part) => part.trim())
     .filter((part) => !part.toLowerCase().startsWith("max-age"))
     .filter((part) => !part.toLowerCase().startsWith("expires"));
   const expires = `Expires=${new Date(0).toUTCString()}`;
-  const [, ...settings] = cookieParts; // first part is the cookie value, which we'll clear
-  return ["", ...settings, expires].join("; ");
+  return ["", ...parts, expires].join("; ");
 }
 
 function decodeToken(jwt: string) {
   const tokenBody = jwt.split(".")[1];
-  const decodableTokenBody = tokenBody.replace(/-/g, "+").replace(/_/g, "/");
-  return JSON.parse(Buffer.from(decodableTokenBody, "base64").toString());
+  return JSON.parse(Buffer.from(tokenBody, "base64url").toString());
 }
 
 const AGENT = new Agent({ keepAlive: true });
+
+class NonRetryableFetchError extends Error {}
 
 export async function httpPostToCognitoWithRetry(
   url: string,
@@ -500,22 +561,41 @@ export async function httpPostToCognitoWithRetry(
         ...options,
         method: "POST",
       }).then((res) => {
-        if (res.status !== 200) {
-          throw new Error(`Status is ${res.status}, expected 200`);
-        }
+        const responseData = res.data.toString();
+        logger.debug(
+          `Response from Cognito:`,
+          JSON.stringify({
+            status: res.status,
+            headers: res.headers,
+            data: responseData,
+          })
+        );
         if (!res.headers["content-type"]?.startsWith("application/json")) {
           throw new Error(
             `Content-Type is ${res.headers["content-type"]}, expected application/json`
           );
         }
+        const parsedResponseData = JSON.parse(responseData);
+        if (res.status !== 200) {
+          const errorMessage =
+            parsedResponseData.error || `Status is ${res.status}, expected 200`;
+          if (res.status && res.status >= 400 && res.status < 500) {
+            // No use in retrying client errors
+            throw new NonRetryableFetchError(errorMessage);
+          } else {
+            throw new Error(errorMessage);
+          }
+        }
         return {
           ...res,
-          data: JSON.parse(res.data.toString()),
+          data: parsedResponseData,
         };
       });
     } catch (err) {
-      logger.debug(`HTTP POST to ${url} failed (attempt ${attempts}):`);
-      logger.debug(err);
+      logger.debug(`HTTP POST to ${url} failed (attempt ${attempts}): ${err}`);
+      if (err instanceof NonRetryableFetchError) {
+        throw err;
+      }
       if (attempts >= 5) {
         // Try 5 times at most
         logger.error(
